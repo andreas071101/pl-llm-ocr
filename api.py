@@ -1,0 +1,101 @@
+import os
+import tempfile
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from functools import partial
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+from pdf2md import pdf_to_markdown_string
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def _require(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"Required env var {key!r} is not set")
+    return val
+
+
+PAPERLESS_URL = _require("PAPERLESS_URL").rstrip("/")
+PAPERLESS_TOKEN = _require("PAPERLESS_TOKEN")
+VISION_CONFIG = {
+    "url":    _require("LOKALE_API_URL"),
+    "modell": _require("LOKALES_VISION_MODELL"),
+    "key":    _require("LOKALER_API_KEY"),
+}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(
+        headers={"Authorization": f"Token {PAPERLESS_TOKEN}"},
+        timeout=60.0,
+    )
+    yield
+    await app.state.http.aclose()
+
+
+app = FastAPI(title="pdf2md-webhook", lifespan=lifespan)
+
+
+class ProcessRequest(BaseModel):
+    document_id: int
+
+
+class ProcessResponse(BaseModel):
+    success: bool
+    document_id: int
+    content_length: int
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/process", response_model=ProcessResponse)
+async def process_document(req: ProcessRequest, request: Request):
+    doc_id = req.document_id
+    client: httpx.AsyncClient = request.app.state.http
+    logger.info("Processing document %d", doc_id)
+
+    resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/")
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"Download failed: {resp.text[:200]}")
+
+    # delete=False: pdf2image needs the file to exist on disk during conversion
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(resp.content)
+        tmp_path = tmp.name
+
+    try:
+        loop = asyncio.get_event_loop()
+        markdown = await loop.run_in_executor(
+            None, partial(pdf_to_markdown_string, tmp_path, VISION_CONFIG)
+        )
+    except Exception as e:
+        logger.error("Conversion failed for document %d: %s", doc_id, e)
+        raise HTTPException(500, f"Conversion error: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    patch = await client.patch(
+        f"{PAPERLESS_URL}/api/documents/{doc_id}/",
+        json={"content": markdown},
+    )
+    if patch.status_code not in (200, 201):
+        raise HTTPException(patch.status_code, f"PATCH failed: {patch.text[:200]}")
+
+    logger.info("Done: document %d, %d chars", doc_id, len(markdown))
+    return ProcessResponse(success=True, document_id=doc_id, content_length=len(markdown))
