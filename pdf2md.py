@@ -1,21 +1,33 @@
 import argparse
 import base64
+import logging
 import os
+import time
 from io import BytesIO
 from openai import OpenAI
 from pdf2image import convert_from_path
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
+
 def _convert_pdf_to_markdown(pdf_path: str, config: dict) -> str:
+    logger.info("Vision API URL: %s", config["url"])
+    logger.info("Model: %s", config["modell"])
+
     pages = convert_from_path(pdf_path)
+    anzahl_seiten = len(pages)
+    logger.info("PDF loaded: %d page(s)", anzahl_seiten)
+
     client = OpenAI(base_url=config["url"], api_key=config["key"])
     gesamt_markdown = []
-    anzahl_seiten = len(pages)
 
     for i, page in enumerate(pages):
         buffered = BytesIO()
         page.save(buffered, format="JPEG", quality=80)
-        img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        img_bytes = buffered.getvalue()
+        img_base64 = base64.b64encode(img_bytes).decode("utf-8")
+        logger.info("Page %d/%d — image size: %d bytes, sending to vision API...", i + 1, anzahl_seiten, len(img_bytes))
 
         messages_content = [
             {
@@ -34,12 +46,14 @@ def _convert_pdf_to_markdown(pdf_path: str, config: dict) -> str:
             }
         ]
 
+        t0 = time.monotonic()
         try:
             response = client.chat.completions.create(
                 model=config["modell"],
                 messages=[{"role": "user", "content": messages_content}],
                 max_tokens=2048
             )
+            elapsed = time.monotonic() - t0
 
             seite_markdown = response.choices[0].message.content
 
@@ -48,9 +62,12 @@ def _convert_pdf_to_markdown(pdf_path: str, config: dict) -> str:
             elif seite_markdown.startswith("```"):
                 seite_markdown = seite_markdown.split("```")[1].rsplit("```", 1)[0].strip()
 
+            logger.info("Page %d/%d — done in %.1fs, %d chars returned", i + 1, anzahl_seiten, elapsed, len(seite_markdown))
             gesamt_markdown.append(seite_markdown)
 
         except Exception as e:
+            elapsed = time.monotonic() - t0
+            logger.error("Page %d/%d — failed after %.1fs: %s", i + 1, anzahl_seiten, elapsed, e)
             gesamt_markdown.append(f"\n* Fehler auf Seite {i+1}: {e} *\n")
 
     return "\n\n---\n\n".join(gesamt_markdown)

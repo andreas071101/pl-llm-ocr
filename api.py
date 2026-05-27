@@ -2,6 +2,7 @@ import os
 import tempfile
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from functools import partial
 
@@ -13,7 +14,7 @@ from dotenv import load_dotenv
 from pdf2md import pdf_to_markdown_string
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +32,10 @@ VISION_CONFIG = {
     "modell": _require("LOKALES_VISION_MODELL"),
     "key":    _require("LOKALER_API_KEY"),
 }
+
+logger.info("Paperless URL: %s", PAPERLESS_URL)
+logger.info("Vision API URL: %s", VISION_CONFIG["url"])
+logger.info("Vision model: %s", VISION_CONFIG["modell"])
 
 
 @asynccontextmanager
@@ -67,22 +72,27 @@ async def process_document(req: ProcessRequest, request: Request):
     client: httpx.AsyncClient = request.app.state.http
     logger.info("Processing document %d", doc_id)
 
+    logger.info("Downloading PDF for document %d from %s", doc_id, PAPERLESS_URL)
     resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/")
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, f"Download failed: {resp.text[:200]}")
+    logger.info("Downloaded %d bytes", len(resp.content))
 
     # delete=False: pdf2image needs the file to exist on disk during conversion
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
         tmp.write(resp.content)
         tmp_path = tmp.name
 
+    t0 = time.monotonic()
     try:
         loop = asyncio.get_event_loop()
+        logger.info("Starting conversion (this may take a while while the model warms up)...")
         markdown = await loop.run_in_executor(
             None, partial(pdf_to_markdown_string, tmp_path, VISION_CONFIG)
         )
+        logger.info("Conversion complete in %.1fs", time.monotonic() - t0)
     except Exception as e:
-        logger.error("Conversion failed for document %d: %s", doc_id, e)
+        logger.error("Conversion failed for document %d after %.1fs: %s", doc_id, time.monotonic() - t0, e)
         raise HTTPException(500, f"Conversion error: {e}")
     finally:
         try:
@@ -90,6 +100,7 @@ async def process_document(req: ProcessRequest, request: Request):
         except OSError:
             pass
 
+    logger.info("Patching content back to paperless-ngx...")
     patch = await client.patch(
         f"{PAPERLESS_URL}/api/documents/{doc_id}/",
         json={"content": markdown},
@@ -97,5 +108,5 @@ async def process_document(req: ProcessRequest, request: Request):
     if patch.status_code not in (200, 201):
         raise HTTPException(patch.status_code, f"PATCH failed: {patch.text[:200]}")
 
-    logger.info("Done: document %d, %d chars", doc_id, len(markdown))
+    logger.info("Done: document %d, %d chars in %.1fs total", doc_id, len(markdown), time.monotonic() - t0)
     return ProcessResponse(success=True, document_id=doc_id, content_length=len(markdown))
