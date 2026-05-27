@@ -52,7 +52,14 @@ app = FastAPI(title="pdf2md-webhook", lifespan=lifespan)
 
 
 class ProcessRequest(BaseModel):
-    document_id: int
+    document_id: int | None = None
+    id: int | None = None
+
+    def resolved_id(self) -> int:
+        doc_id = self.document_id or self.id
+        if doc_id is None:
+            raise ValueError("document_id or id required")
+        return doc_id
 
 
 class ProcessResponse(BaseModel):
@@ -68,7 +75,7 @@ async def health():
 
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(req: ProcessRequest, request: Request):
-    doc_id = req.document_id
+    doc_id = req.resolved_id()
     client: httpx.AsyncClient = request.app.state.http
     logger.info("Processing document %d", doc_id)
 
