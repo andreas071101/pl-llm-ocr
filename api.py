@@ -8,6 +8,7 @@ from functools import partial
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from pdf2md import pdf_to_markdown_string
@@ -69,7 +70,7 @@ async def _find_document_id_by_filename(client: httpx.AsyncClient, filename: str
     raise HTTPException(400, f"No documents found in paperless for filename: {filename}")
 
 
-async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None):
+async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None) -> bool:
     client: httpx.AsyncClient = app.state.http
 
     if pdf_bytes is None:
@@ -77,7 +78,7 @@ async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None)
         resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/")
         if resp.status_code != 200:
             logger.error("Download failed for document %d: %s", doc_id, resp.text[:200])
-            return
+            return False
         pdf_bytes = resp.content
         logger.info("Downloaded %d bytes", len(pdf_bytes))
 
@@ -95,7 +96,7 @@ async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None)
         logger.info("Conversion complete in %.1fs", time.monotonic() - t0)
     except Exception as e:
         logger.error("Conversion failed for document %d after %.1fs: %s", doc_id, time.monotonic() - t0, e)
-        return
+        return False
     finally:
         try:
             os.unlink(tmp_path)
@@ -109,9 +110,91 @@ async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None)
     )
     if patch.status_code not in (200, 201):
         logger.error("PATCH failed for document %d: %s", doc_id, patch.text[:200])
-        return
+        return False
 
     logger.info("Done: document %d, %d chars in %.1fs total", doc_id, len(markdown), time.monotonic() - t0)
+    return True
+
+
+async def _get_tag_id(client: httpx.AsyncClient, tag_name: str) -> int | None:
+    resp = await client.get(f"{PAPERLESS_URL}/api/tags/", params={"name__iexact": tag_name})
+    if resp.status_code != 200:
+        return None
+    for tag in resp.json().get("results", []):
+        if tag.get("name", "").lower() == tag_name.lower():
+            return tag["id"]
+    return None
+
+
+async def _get_documents_by_tag(client: httpx.AsyncClient, tag_id: int) -> list[dict]:
+    documents: list[dict] = []
+    url: str | None = f"{PAPERLESS_URL}/api/documents/"
+    params: dict = {"tags__id__in": tag_id, "page_size": 100}
+    while url:
+        resp = await client.get(url, params=params)
+        if resp.status_code != 200:
+            logger.error("Failed to fetch documents for tag %d: %s", tag_id, resp.text[:200])
+            break
+        data = resp.json()
+        documents.extend(data.get("results", []))
+        url = data.get("next")
+        params = {}
+    return documents
+
+
+async def _update_document_tags(
+    client: httpx.AsyncClient,
+    doc_id: int,
+    remove_tag_id: int,
+    add_tag_id: int | None,
+):
+    resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/")
+    if resp.status_code != 200:
+        logger.error("Could not fetch document %d to update tags", doc_id)
+        return
+    current_tags: list[int] = resp.json().get("tags", [])
+    new_tags = [t for t in current_tags if t != remove_tag_id]
+    if add_tag_id is not None and add_tag_id not in new_tags:
+        new_tags.append(add_tag_id)
+    patch = await client.patch(f"{PAPERLESS_URL}/api/documents/{doc_id}/", json={"tags": new_tags})
+    if patch.status_code not in (200, 201):
+        logger.error("Tag update failed for document %d: %s", doc_id, patch.text[:200])
+    else:
+        logger.info("Tags updated for document %d", doc_id)
+
+
+async def _process_documents_by_tag(app: FastAPI, tag_name: str, done_tag_name: str | None):
+    client: httpx.AsyncClient = app.state.http
+
+    source_tag_id = await _get_tag_id(client, tag_name)
+    if source_tag_id is None:
+        logger.error("Tag %r not found in paperless-ngx", tag_name)
+        return
+    logger.info("Source tag %r → ID %d", tag_name, source_tag_id)
+
+    done_tag_id: int | None = None
+    if done_tag_name:
+        done_tag_id = await _get_tag_id(client, done_tag_name)
+        if done_tag_id is None:
+            logger.warning("Done tag %r not found, proceeding without it", done_tag_name)
+        else:
+            logger.info("Done tag %r → ID %d", done_tag_name, done_tag_id)
+
+    documents = await _get_documents_by_tag(client, source_tag_id)
+    logger.info("Found %d document(s) with tag %r", len(documents), tag_name)
+
+    succeeded = 0
+    for doc in documents:
+        doc_id = doc["id"]
+        logger.info("Processing document %d (%s)", doc_id, doc.get("title", ""))
+        ok = await _convert_and_patch(app, doc_id, None)
+        if ok:
+            await _update_document_tags(client, doc_id, source_tag_id, done_tag_id)
+            succeeded += 1
+        else:
+            logger.warning("Skipping tag update for document %d due to conversion failure", doc_id)
+
+    logger.info("Batch complete: %d/%d succeeded", succeeded, len(documents))
 
 
 @app.get("/health")
@@ -147,3 +230,15 @@ async def process_document(request: Request, background_tasks: BackgroundTasks):
     logger.info("Accepted document %d, starting background conversion", doc_id)
     background_tasks.add_task(_convert_and_patch, request.app, doc_id, pdf_bytes)
     return {"accepted": True, "document_id": doc_id}
+
+
+class ProcessByTagRequest(BaseModel):
+    tag: str
+    done_tag: str | None = None
+
+
+@app.post("/process-by-tag", status_code=202)
+async def process_by_tag(req: ProcessByTagRequest, background_tasks: BackgroundTasks):
+    logger.info("Accepted batch job: tag=%r, done_tag=%r", req.tag, req.done_tag)
+    background_tasks.add_task(_process_documents_by_tag, app, req.tag, req.done_tag)
+    return {"accepted": True, "tag": req.tag, "done_tag": req.done_tag}
