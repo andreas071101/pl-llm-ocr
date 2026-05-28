@@ -1,3 +1,4 @@
+import json as json_module
 import os
 import tempfile
 import asyncio
@@ -51,21 +52,41 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="pdf2md-webhook", lifespan=lifespan)
 
 
-class ProcessRequest(BaseModel):
-    document_id: int | None = None
-    id: int | None = None
-
-    def resolved_id(self) -> int:
-        doc_id = self.document_id or self.id
-        if doc_id is None:
-            raise ValueError("document_id or id required")
-        return doc_id
-
-
 class ProcessResponse(BaseModel):
     success: bool
     document_id: int
     content_length: int
+
+
+async def _extract_document_id(request: Request) -> int:
+    content_type = request.headers.get("content-type", "")
+    logger.info("Incoming Content-Type: %s", content_type)
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        logger.info("Multipart fields: %s", list(form.keys()))
+        for key, value in form.multi_items():
+            if isinstance(value, str):
+                logger.info("Field %r (str): %s", key, value[:200])
+                try:
+                    data = json_module.loads(value)
+                    doc_id = data.get("id") or data.get("document_id") or data.get("pk")
+                    if doc_id:
+                        return int(doc_id)
+                except (json_module.JSONDecodeError, TypeError):
+                    try:
+                        return int(value)
+                    except ValueError:
+                        pass
+            else:
+                logger.info("Field %r (file): filename=%s", key, getattr(value, "filename", "?"))
+        raise HTTPException(400, "Could not extract document_id from multipart payload")
+
+    body = await request.json()
+    doc_id = body.get("document_id") or body.get("id") or body.get("pk")
+    if not doc_id:
+        raise HTTPException(400, "document_id, id, or pk required in JSON body")
+    return int(doc_id)
 
 
 @app.get("/health")
@@ -74,8 +95,8 @@ async def health():
 
 
 @app.post("/process", response_model=ProcessResponse)
-async def process_document(req: ProcessRequest, request: Request):
-    doc_id = req.resolved_id()
+async def process_document(request: Request):
+    doc_id = await _extract_document_id(request)
     client: httpx.AsyncClient = request.app.state.http
     logger.info("Processing document %d", doc_id)
 
