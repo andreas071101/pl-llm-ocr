@@ -1,4 +1,3 @@
-import json as json_module
 import os
 import tempfile
 import asyncio
@@ -58,35 +57,24 @@ class ProcessResponse(BaseModel):
     content_length: int
 
 
-async def _extract_document_id(request: Request) -> int:
-    content_type = request.headers.get("content-type", "")
-    logger.info("Incoming Content-Type: %s", content_type)
-
-    if "multipart/form-data" in content_type:
-        form = await request.form()
-        logger.info("Multipart fields: %s", list(form.keys()))
-        for key, value in form.multi_items():
-            if isinstance(value, str):
-                logger.info("Field %r (str): %s", key, value[:200])
-                try:
-                    data = json_module.loads(value)
-                    doc_id = data.get("id") or data.get("document_id") or data.get("pk")
-                    if doc_id:
-                        return int(doc_id)
-                except (json_module.JSONDecodeError, TypeError):
-                    try:
-                        return int(value)
-                    except ValueError:
-                        pass
-            else:
-                logger.info("Field %r (file): filename=%s", key, getattr(value, "filename", "?"))
-        raise HTTPException(400, "Could not extract document_id from multipart payload")
-
-    body = await request.json()
-    doc_id = body.get("document_id") or body.get("id") or body.get("pk")
-    if not doc_id:
-        raise HTTPException(400, "document_id, id, or pk required in JSON body")
-    return int(doc_id)
+async def _find_document_id_by_filename(client: httpx.AsyncClient, filename: str) -> int:
+    resp = await client.get(
+        f"{PAPERLESS_URL}/api/documents/",
+        params={"ordering": "-added", "page_size": 10},
+    )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, f"Could not query paperless documents: {resp.text[:200]}")
+    results = resp.json().get("results", [])
+    for doc in results:
+        if doc.get("original_file_name") == filename or doc.get("title") == filename.rsplit(".", 1)[0]:
+            logger.info("Matched document ID %d for filename %s", doc["id"], filename)
+            return doc["id"]
+    # Fallback: return the most recently added document
+    if results:
+        doc_id = results[0]["id"]
+        logger.warning("No exact filename match, using most recently added document ID %d", doc_id)
+        return doc_id
+    raise HTTPException(400, f"No documents found in paperless for filename: {filename}")
 
 
 @app.get("/health")
@@ -96,19 +84,41 @@ async def health():
 
 @app.post("/process", response_model=ProcessResponse)
 async def process_document(request: Request):
-    doc_id = await _extract_document_id(request)
     client: httpx.AsyncClient = request.app.state.http
+    content_type = request.headers.get("content-type", "")
+    logger.info("Incoming Content-Type: %s", content_type)
+
+    pdf_bytes = None
+    doc_id = None
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        file_field = form.get("file")
+        if file_field is None:
+            raise HTTPException(400, "No 'file' field in multipart payload")
+        filename = file_field.filename
+        pdf_bytes = await file_field.read()
+        logger.info("Received file: %s (%d bytes)", filename, len(pdf_bytes))
+        doc_id = await _find_document_id_by_filename(client, filename)
+    else:
+        body = await request.json()
+        doc_id = body.get("document_id") or body.get("id") or body.get("pk")
+        if not doc_id:
+            raise HTTPException(400, "document_id, id, or pk required in JSON body")
+        doc_id = int(doc_id)
+
     logger.info("Processing document %d", doc_id)
 
-    logger.info("Downloading PDF for document %d from %s", doc_id, PAPERLESS_URL)
-    resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/")
-    if resp.status_code != 200:
-        raise HTTPException(resp.status_code, f"Download failed: {resp.text[:200]}")
-    logger.info("Downloaded %d bytes", len(resp.content))
+    if pdf_bytes is None:
+        logger.info("Downloading PDF for document %d from %s", doc_id, PAPERLESS_URL)
+        resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/download/")
+        if resp.status_code != 200:
+            raise HTTPException(resp.status_code, f"Download failed: {resp.text[:200]}")
+        pdf_bytes = resp.content
+        logger.info("Downloaded %d bytes", len(pdf_bytes))
 
-    # delete=False: pdf2image needs the file to exist on disk during conversion
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-        tmp.write(resp.content)
+        tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
     t0 = time.monotonic()
