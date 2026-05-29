@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 
 import httpx
+import yaml
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -44,6 +45,14 @@ async def lifespan(app: FastAPI):
         headers={"Authorization": f"Token {PAPERLESS_TOKEN}"},
         timeout=60.0,
     )
+    prompts_path = os.getenv("PROMPTS_FILE", "prompts.yml")
+    if os.path.exists(prompts_path):
+        with open(prompts_path) as f:
+            app.state.prompts = yaml.safe_load(f) or {}
+        logger.info("Loaded %d prompt(s) from %s", len(app.state.prompts), prompts_path)
+    else:
+        app.state.prompts = {}
+        logger.warning("Prompts file not found: %s — using built-in default prompt", prompts_path)
     yield
     await app.state.http.aclose()
 
@@ -70,6 +79,32 @@ async def _find_document_id_by_filename(client: httpx.AsyncClient, filename: str
     raise HTTPException(400, f"No documents found in paperless for filename: {filename}")
 
 
+async def _get_document_type_name(client: httpx.AsyncClient, doc_id: int) -> str | None:
+    resp = await client.get(f"{PAPERLESS_URL}/api/documents/{doc_id}/")
+    if resp.status_code != 200:
+        return None
+    type_id = resp.json().get("document_type")
+    if not type_id:
+        return None
+    resp2 = await client.get(f"{PAPERLESS_URL}/api/document_types/{type_id}/")
+    if resp2.status_code != 200:
+        return None
+    return resp2.json().get("name")
+
+
+async def _resolve_prompt(app: FastAPI, doc_id: int) -> str | None:
+    prompts: dict = getattr(app.state, "prompts", {})
+    if not prompts:
+        return None
+    doc_type = await _get_document_type_name(app.state.http, doc_id)
+    if doc_type and doc_type in prompts:
+        logger.info("Document %d: using prompt for type %r", doc_id, doc_type)
+        return prompts[doc_type]
+    if doc_type:
+        logger.info("Document %d: no prompt for type %r, using default", doc_id, doc_type)
+    return prompts.get("default")
+
+
 async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None) -> bool:
     client: httpx.AsyncClient = app.state.http
 
@@ -86,12 +121,15 @@ async def _convert_and_patch(app: FastAPI, doc_id: int, pdf_bytes: bytes | None)
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
+    prompt = await _resolve_prompt(app, doc_id)
+    config = {**VISION_CONFIG, "prompt": prompt}
+
     t0 = time.monotonic()
     try:
         loop = asyncio.get_event_loop()
         logger.info("Starting conversion for document %d...", doc_id)
         markdown = await loop.run_in_executor(
-            None, partial(pdf_to_markdown_string, tmp_path, VISION_CONFIG)
+            None, partial(pdf_to_markdown_string, tmp_path, config)
         )
         logger.info("Conversion complete in %.1fs", time.monotonic() - t0)
     except Exception as e:

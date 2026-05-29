@@ -77,6 +77,43 @@ curl http://localhost:8000/health
 # {"status":"ok"}
 ```
 
+## Prompts
+
+OCR prompts are configured in `prompts.yml`. The file has a `default` key used as a fallback, plus optional keys named after paperless-ngx document types. When a document is processed, its document type is fetched from paperless-ngx and matched against the prompts file; if no specific prompt exists for that type the `default` is used.
+
+```yaml
+default: |
+  You are a precise OCR system. Convert the content of this PDF page (page {page} of {total})
+  into clean Markdown format. Preserve headings, lists, and tables.
+  Return ONLY the raw Markdown, without any introduction, code fences, or explanations.
+
+Invoice: |
+  You are a precise OCR system specializing in invoices and financial documents.
+  ...
+
+Letter: |
+  ...
+```
+
+The placeholders `{page}` and `{total}` are replaced with the current page number and total page count at runtime. The document type keys must match the type names in paperless-ngx exactly (case-sensitive).
+
+To use a custom prompts file, set the `PROMPTS_FILE` environment variable:
+
+```
+PROMPTS_FILE=/path/to/my-prompts.yml
+```
+
+To mount a custom file into the container without rebuilding:
+
+```bash
+docker run -d \
+  --name pl-llm-ocr \
+  -p 8000:8000 \
+  --env-file .env \
+  -v /path/to/my-prompts.yml:/app/prompts.yml \
+  pl-llm-ocr
+```
+
 ## paperless-ngx workflow setup
 
 Create a workflow in paperless-ngx (Settings → Workflows):

@@ -10,33 +10,37 @@ from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_PROMPT = (
+    "You are a precise OCR system. Convert the content of this PDF page (page {page} of {total}) "
+    "into clean Markdown format. Preserve headings, lists, and tables. "
+    "Return ONLY the raw Markdown, without any introduction, code fences, or explanations."
+)
+
 
 def _convert_pdf_to_markdown(pdf_path: str, config: dict) -> str:
     logger.info("Vision API URL: %s", config["url"])
     logger.info("Model: %s", config["modell"])
 
     pages = convert_from_path(pdf_path)
-    anzahl_seiten = len(pages)
-    logger.info("PDF loaded: %d page(s)", anzahl_seiten)
+    total = len(pages)
+    logger.info("PDF loaded: %d page(s)", total)
 
+    prompt_template = config.get("prompt") or DEFAULT_PROMPT
     client = OpenAI(base_url=config["url"], api_key=config["key"])
-    gesamt_markdown = []
+    result_pages = []
 
     for i, page in enumerate(pages):
         buffered = BytesIO()
         page.save(buffered, format="JPEG", quality=80)
         img_bytes = buffered.getvalue()
         img_base64 = base64.b64encode(img_bytes).decode("utf-8")
-        logger.info("Page %d/%d — image size: %d bytes, sending to vision API...", i + 1, anzahl_seiten, len(img_bytes))
+        logger.info("Page %d/%d — image size: %d bytes, sending to vision API...", i + 1, total, len(img_bytes))
 
+        prompt_text = prompt_template.format(page=i + 1, total=total)
         messages_content = [
             {
                 "type": "text",
-                "text": (
-                    f"You are a precise OCR system. Convert the content of this PDF page (page {i+1}) "
-                    "into clean Markdown format. Preserve headings, lists, and tables. "
-                    "Return ONLY the raw Markdown, without any introduction, code fences, or explanations."
-                )
+                "text": prompt_text,
             },
             {
                 "type": "image_url",
@@ -55,22 +59,22 @@ def _convert_pdf_to_markdown(pdf_path: str, config: dict) -> str:
             )
             elapsed = time.monotonic() - t0
 
-            seite_markdown = response.choices[0].message.content
+            page_markdown = response.choices[0].message.content
 
-            if seite_markdown.startswith("```markdown"):
-                seite_markdown = seite_markdown.split("```markdown")[1].rsplit("```", 1)[0].strip()
-            elif seite_markdown.startswith("```"):
-                seite_markdown = seite_markdown.split("```")[1].rsplit("```", 1)[0].strip()
+            if page_markdown.startswith("```markdown"):
+                page_markdown = page_markdown.split("```markdown")[1].rsplit("```", 1)[0].strip()
+            elif page_markdown.startswith("```"):
+                page_markdown = page_markdown.split("```")[1].rsplit("```", 1)[0].strip()
 
-            logger.info("Page %d/%d — done in %.1fs, %d chars returned", i + 1, anzahl_seiten, elapsed, len(seite_markdown))
-            gesamt_markdown.append(seite_markdown)
+            logger.info("Page %d/%d — done in %.1fs, %d chars returned", i + 1, total, elapsed, len(page_markdown))
+            result_pages.append(page_markdown)
 
         except Exception as e:
             elapsed = time.monotonic() - t0
-            logger.error("Page %d/%d — failed after %.1fs: %s", i + 1, anzahl_seiten, elapsed, e)
-            gesamt_markdown.append(f"\n* Error on page {i+1}: {e} *\n")
+            logger.error("Page %d/%d — failed after %.1fs: %s", i + 1, total, elapsed, e)
+            result_pages.append(f"\n* Error on page {i+1}: {e} *\n")
 
-    return "\n\n---\n\n".join(gesamt_markdown)
+    return "\n\n---\n\n".join(result_pages)
 
 
 def pdf_to_markdown_local(pdf_path: str, output_md_path: str, config: dict):
@@ -119,6 +123,20 @@ if __name__ == "__main__":
         help="Path to a specific .env file (optional)"
     )
 
+    # Prompt options
+    parser.add_argument(
+        "--prompt-file",
+        type=str,
+        default=None,
+        help="Path to a YAML prompts file (default: prompts.yml if present)"
+    )
+    parser.add_argument(
+        "--document-type",
+        type=str,
+        default=None,
+        help="Document type name to select a prompt from the prompts file"
+    )
+
     # API options (override .env values)
     parser.add_argument(
         "--url",
@@ -147,19 +165,37 @@ if __name__ == "__main__":
     else:
         load_dotenv()
 
+    # Load prompts file
+    prompts: dict = {}
+    prompts_path = args.prompt_file or "prompts.yml"
+    if os.path.exists(prompts_path):
+        import yaml
+        with open(prompts_path) as f:
+            prompts = yaml.safe_load(f) or {}
+        print(f"Loaded prompts from {prompts_path}")
+
+    prompt: str | None = None
+    if args.document_type:
+        prompt = prompts.get(args.document_type) or prompts.get("default")
+        print(f"Prompt: {args.document_type!r} ({'matched' if prompts.get(args.document_type) else 'using default'})")
+    elif prompts.get("default"):
+        prompt = prompts["default"]
+
     # Resolution order: CLI argument -> .env variable -> built-in default
     config = {
-        "url": args.url or os.getenv("VISION_API_URL", "http://localhost:11434/v1"),
+        "url":    args.url or os.getenv("VISION_API_URL", "http://localhost:11434/v1"),
         "modell": args.model or os.getenv("VISION_MODEL", "llama3.2-vision"),
-        "key": args.key or os.getenv("VISION_API_KEY", "ollama")
+        "key":    args.key or os.getenv("VISION_API_KEY", "ollama"),
+        "prompt": prompt,
     }
 
     print("\n--- Configuration ---")
-    print(f"Input PDF:   {args.pdf}")
-    print(f"Output MD:   {args.output}")
-    print(f"API URL:     {config['url']}")
-    print(f"Model:       {config['modell']}")
-    print(f"API key:     {'***' + config['key'][-3:] if len(config['key']) > 3 else 'set'}")
+    print(f"Input PDF:      {args.pdf}")
+    print(f"Output MD:      {args.output}")
+    print(f"API URL:        {config['url']}")
+    print(f"Model:          {config['modell']}")
+    print(f"API key:        {'***' + config['key'][-3:] if len(config['key']) > 3 else 'set'}")
+    print(f"Document type:  {args.document_type or '(none)'}")
     print("---------------------\n")
 
     if os.path.exists(args.pdf):

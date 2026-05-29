@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY pdf2md.py .
 COPY api.py .
+COPY prompts.yml .
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
 
