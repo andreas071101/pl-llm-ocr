@@ -147,3 +147,7 @@ python pdf2md.py document.pdf \
 ```
 
 Settings are resolved in this order: CLI argument → `.env` variable → built-in default.
+
+## About
+
+This project was vibe coded with the help of [Claude Code](https://claude.ai/code). The entire service — from the initial PDF conversion script to the FastAPI webhook integration, Docker setup, and batch processing — was designed and built interactively with Claude as a pair programming partner.
