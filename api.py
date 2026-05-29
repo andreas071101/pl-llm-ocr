@@ -28,9 +28,9 @@ def _require(key: str) -> str:
 PAPERLESS_URL = _require("PAPERLESS_URL").rstrip("/")
 PAPERLESS_TOKEN = _require("PAPERLESS_TOKEN")
 VISION_CONFIG = {
-    "url":    _require("LOKALE_API_URL"),
-    "modell": _require("LOKALES_VISION_MODELL"),
-    "key":    _require("LOKALER_API_KEY"),
+    "url":    _require("VISION_API_URL"),
+    "modell": _require("VISION_MODEL"),
+    "key":    _require("VISION_API_KEY"),
 }
 
 logger.info("Paperless URL: %s", PAPERLESS_URL)

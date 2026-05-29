@@ -149,9 +149,9 @@ if __name__ == "__main__":
 
     # Resolution order: CLI argument -> .env variable -> built-in default
     config = {
-        "url": args.url or os.getenv("LOKALE_API_URL", "http://localhost:11434/v1"),
-        "modell": args.model or os.getenv("LOKALES_VISION_MODELL", "llama3.2-vision"),
-        "key": args.key or os.getenv("LOKALER_API_KEY", "ollama")
+        "url": args.url or os.getenv("VISION_API_URL", "http://localhost:11434/v1"),
+        "modell": args.model or os.getenv("VISION_MODEL", "llama3.2-vision"),
+        "key": args.key or os.getenv("VISION_API_KEY", "ollama")
     }
 
     print("\n--- Configuration ---")

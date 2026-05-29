@@ -31,18 +31,18 @@ All configuration is supplied via environment variables (or a `.env` file, never
 |---|---|
 | `PAPERLESS_URL` | Base URL of paperless-ngx, e.g. `http://192.168.1.10:8000` |
 | `PAPERLESS_TOKEN` | paperless-ngx API token (Settings → API) |
-| `LOKALE_API_URL` | Base URL of the vision LLM endpoint, e.g. `http://my-server/v1` |
-| `LOKALES_VISION_MODELL` | Model name, e.g. `gemma-4-26b-mtp-vision` |
-| `LOKALER_API_KEY` | API key for the LLM endpoint (`ollama` if none required) |
+| `VISION_API_URL` | Base URL of the vision LLM endpoint, e.g. `http://my-server/v1` |
+| `VISION_MODEL` | Model name, e.g. `gemma-4-26b-mtp-vision` |
+| `VISION_API_KEY` | API key for the LLM endpoint (`ollama` if none required) |
 
 Copy `.env.example` to `.env` and fill in the values:
 
 ```
 PAPERLESS_URL=http://192.168.1.10:8000
 PAPERLESS_TOKEN=your-paperless-token
-LOKALE_API_URL=http://your-llm-server/v1
-LOKALES_VISION_MODELL=gemma-4-26b-mtp-vision
-LOKALER_API_KEY=ollama
+VISION_API_URL=http://your-llm-server/v1
+VISION_MODEL=gemma-4-26b-mtp-vision
+VISION_API_KEY=ollama
 ```
 
 ### mDNS / hostname resolution
